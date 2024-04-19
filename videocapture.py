@@ -1,103 +1,55 @@
+# Copyright 2022-2024 PufferOverflow <puffer@puffer.moe>
+# SPDX-License-Identifier: MPL-1.1
+#
+# The contents of this file are subject to the Mozilla Public License
+# Version 1.1 (the "License"); you may not use this file except in
+# compliance with the License. You may obtain a copy of the License at
+# https://www.mozilla.org/MPL/1.1/
+
 from typing import Iterable
-from threading import Semaphore, Event
-from asyncio import CancelledError
+from threading import Event
+from asyncio import events
 from winrt.windows.media.capture.frames import MediaFrameSourceGroup, MediaFrameSourceInfo, MediaFrameReader, MediaFrameArrivedEventArgs, MediaFrameSourceKind
 from winrt.windows.media.capture import MediaCapture, MediaCaptureInitializationSettings, MediaStreamType, MediaCaptureMemoryPreference, StreamingCaptureMode
 from winrt.windows.storage.streams import Buffer
 from winrt.windows.security.cryptography import CryptographicBuffer
+from collections import Counter
 
 
 class VideoCapture:
-    """
-    VideoCapture(selected_kind: str, selected_type: str, raw_output: bool)
-
-    a VideoCapture object that controls the video capturing process and returns captured frames
-
-    ### Parameters:
-
-    selected_kind: str, the kind of video source you want to use
-                    available values are `CUSTOM`,`COLOR`,`INFRARED`,`DEPTH`,`AUDIO`,`IMAGE`,`METADATA`
-    selected_type: str, the type of capture mode you want to use
-                    available values are `VIDEO_PREVIEW`,`VIDEO_RECORD`,`AUDIO`,`PHOTO`,`METADATA`
-    raw_output: bool, control whether to skip black frames
-
-    ...
-
-    ### Attributes:
-
-    options: dict
-
-    current_format: dict
-
-    latest_frame: bytearray
-
-    counters: dict
-
-    ### Methods:
-
-    init()
-
-    start()
-
-    stop()
-
-    frames()
-
-    list_format()
-
-    """
 
     _formatBits: dict = {"NV12": 12}
-    _frame_semaphore: Semaphore = Semaphore(0)
+    _frame_event: Event = Event()
     _stop_event: Event = Event()
 
-    counters = {"frame": 0, "black": 0, "skipped": 0}
+    frame_counter = Counter()
 
-    def __init__(
-        self,
-        selected_kind: str,
-        selected_type: str,
-        raw_output: bool = False,
-        luma_sample: int = 300,
-        luma_base: int = 16,
-        luma_threshold: int = 16,
-        auto_select: bool = True,
-        camera_id: int = -1,
-    ):
-        self.options = {
-            "selected_kind": selected_kind,
-            "selected_type": selected_type,
-            "raw_output": raw_output,
-            "luma_sample": luma_sample,
-            "luma_base": luma_base,
-            "luma_threshold": luma_threshold,
-            "auto_select": auto_select,
-            "camera_id": camera_id,
-        }
+    @staticmethod
+    def wait(afunc):
+        loop = events.new_event_loop()
+        events.set_event_loop(loop)
+        result = loop.run_until_complete(afunc)
+        events.set_event_loop(None)
+        loop.close()
+        return result
 
-    async def start(self):
-        try:
-            await self._media_frame_reader.start_async()
-            self._stop_event.clear()
-        except AttributeError:
-            print("Please initialize first!")
-        except CancelledError:
-            self._stop_event.set()
-            await self._media_frame_reader.stop_async()
-            # Release semaphore to make sure the frame generator won't result in a deadlock
-            self._frame_semaphore.release()
+    def start(self):
+        self._media_frame_reader.start_async()
+        self._stop_event.clear()
+        print("capture started")
 
-    async def stop(self):
-        pass
+    def stop(self):
+        self._stop_event.set()
+        self._media_frame_reader.stop_async()
+        print("capture stopped")
+        # Release semaphore to make sure the frame generator won't result in a deadlock
+        self._frame_event.set()
 
-    async def init(self):
-        # Select camera
-        frame_source_groups = await MediaFrameSourceGroup.find_all_async()
-        selected_group = self._select_camera(
-            frame_source_groups,
-            self.options["selected_kind"],
-            camera_id=0 if self.options["auto_select"] else self.options["camera_id"],
-        )
+    def __init__(self, options = dict()):
+        self.options = options
+
+        frame_source_groups = self.wait(MediaFrameSourceGroup.find_all_async())
+        selected_group = self._select_camera(frame_source_groups, self.options)
 
         # Initializing capture settings
         settings = MediaCaptureInitializationSettings()
@@ -105,8 +57,8 @@ class VideoCapture:
         settings.memory_preference = MediaCaptureMemoryPreference["CPU"]
         settings.streaming_capture_mode = StreamingCaptureMode["VIDEO"]
         media_capture = MediaCapture()
-        await media_capture.initialize_async(settings)
-        source_info = self._select_source_info(selected_group, self.options["selected_kind"], self.options["selected_type"])
+        self.wait(media_capture.initialize_async(settings))
+        source_info = self._select_source_info(selected_group, self.options)
         self._frame_source = media_capture.frame_sources[source_info.id]
         try:
             self.current_format = {
@@ -115,26 +67,26 @@ class VideoCapture:
                 "fps": self._frame_source.current_format.frame_rate.numerator,
                 "type": self._frame_source.current_format.subtype,
             }
+            self._buffer_size = self.current_format["width"] * self.current_format["height"] * self._formatBits[self.current_format["type"]] / 8
+            self._buffer_size = int(self._buffer_size) if self._buffer_size.is_integer() else int(self._buffer_size) + 1
+            self._frame_pixel_number = int(self.current_format["width"] * self.current_format["height"])
+            self._pixel_sample_interval = int(self.current_format["width"] * self.current_format["height"] / int(self.options["option_luma_sample"]))
+            self._pixel_sample_number = int(self.options["option_luma_sample"])
+
         except AttributeError:
             raise AttributeError("Cannot get format infomation!")
-        self._media_frame_reader: MediaFrameReader = await media_capture.create_frame_reader_async(self._frame_source)
+        
+        self._media_frame_reader: MediaFrameReader = self.wait(media_capture.create_frame_reader_async(self._frame_source))
+
         self._media_frame_reader.add_frame_arrived(self._frame_arrived_handler)
 
-    def frames(self):
+    def get_frame(self):
+        print("wait for frame")
         while not self._stop_event.is_set():
-            self._frame_semaphore.acquire()
+            self._frame_event.wait()
+            self._frame_event.clear()
+            print("frame out")
             yield self.latest_frame
-
-    def __enter__(self):
-        from asyncio import new_event_loop, set_event_loop
-
-        self.cam_loop = new_event_loop()
-        set_event_loop(self.cam_loop)
-        self.cam_loop.run_until_complete(self.init())
-        return self.cam_loop
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.cam_loop.run_until_complete(self.stop())
 
     @staticmethod
     def list_format(frame_source):
@@ -168,29 +120,24 @@ class VideoCapture:
             sep="",
         )
 
-    def _select_camera(
-        self,
-        source_groups: Iterable[MediaFrameSourceGroup],
-        camera_kind: str,
-        camera_id: int = -1,
-    ) -> MediaFrameSourceGroup:
+    def _select_camera(self, source_groups: Iterable[MediaFrameSourceGroup], options) -> MediaFrameSourceGroup:
         valid_camera = []
+        camera_kind = options["camera_kind"] if "camera_kind" in options else "INFRARED"
         for camera in source_groups:
             for sourceinfo in camera.source_infos:
                 if sourceinfo.source_kind == MediaFrameSourceKind[camera_kind]:
                     valid_camera.append(camera)
                     break
-        if len(valid_camera) == 0:
-            raise IndexError("No valid camera found")
-        if len(valid_camera) == 1:
-            return valid_camera[0]
-        if len(valid_camera) > 1:
-            if camera_id < 0 or camera_id >= len(valid_camera):
-                raise IndexError("Invalid camera_id selected")
+        if len(valid_camera) > 0:
+            camera_id = options["camera_id"] if "camera_id" in options else 0
             return valid_camera[camera_id]
+        else:
+            raise IndexError("No valid camera found")
 
-    def _select_source_info(self, camera: MediaFrameSourceGroup, camera_kind: str, media_type: str) -> MediaFrameSourceInfo:
+    def _select_source_info(self, camera: MediaFrameSourceGroup, options) -> MediaFrameSourceInfo:
         valid_source = []
+        camera_kind = options["camera_kind"] if "camera_kind" in options else "INFRARED"
+        media_type = options["media_type"] if "media_type" in options else "VIDEO_RECORD"
         for source in camera.source_infos:
             if source.source_kind == MediaFrameSourceKind[camera_kind] and source.media_stream_type == MediaStreamType[media_type]:
                 valid_source.append(source)
@@ -202,23 +149,15 @@ class VideoCapture:
             raise IndexError("Error: multiple sources found")
 
     def _frame_arrived_handler(self, sender: MediaFrameReader, args: MediaFrameArrivedEventArgs) -> None:
-        self.counters["frame"] += 1
-
+        # print('frame arrived')
         # Discard empty frames
         media_frame_reference = sender.try_acquire_latest_frame()
         if media_frame_reference is None:
-            self.counters["skipped"] += 1
+            self.frame_counter["empty"] += 1
             return
 
         # Prepare frame buffer
-        buffer_size = (
-            self.current_format["width"] * self.current_format["height"] * self._formatBits[self.current_format["type"]] / 8
-        )
-        if buffer_size.is_integer():
-            buffer = Buffer(int(buffer_size))
-        else:
-            buffer = Buffer(int(buffer_size) + 1)
-            raise BytesWarning("Decimal buffer size detected, video data may be currupted")
+        buffer = Buffer(self._buffer_size)
 
         # Get image data from frame buffer
         video_media_frame = media_frame_reference.video_media_frame
@@ -227,20 +166,13 @@ class VideoCapture:
         image_data = CryptographicBuffer.copy_to_byte_array(buffer)
 
         # Discard black frames
-        if not self.options["raw_output"]:
-            luma_average = (
-                sum(
-                    image_data[
-                        : int(self.current_format["width"] * self.current_format["height"]) : int(
-                            self.current_format["width"] * self.current_format["height"] / self.options["luma_sample"]
-                        )
-                    ]
-                )
-                / self.options["luma_sample"]
-            )
-            if luma_average < self.options["luma_base"] + self.options["luma_threshold"]:
-                self.counters["black"] += 1
+        if not self.options["option_luma_auto"]:
+            luma_average = (sum(image_data[:self._frame_pixel_number:self._pixel_sample_interval]) / self._pixel_sample_number)
+            if luma_average < self.options["option_luma_base"] + self.options["option_luma_threshold"]:
+                self.frame_counter["black"] += 1
                 return
 
         self.latest_frame = image_data
-        self._frame_semaphore.release()
+        self.frame_counter["good"] += 1
+        print("frame processing done")
+        self._frame_event.set()

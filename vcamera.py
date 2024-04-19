@@ -1,62 +1,48 @@
+# Copyright 2022-2024 PufferOverflow <puffer@puffer.moe>
+# SPDX-License-Identifier: MPL-1.1
+#
+# The contents of this file are subject to the Mozilla Public License
+# Version 1.1 (the "License"); you may not use this file except in
+# compliance with the License. You may obtain a copy of the License at
+# https://www.mozilla.org/MPL/1.1/
+
 from videocapture import VideoCapture
-from threading import Thread
+from threading import Thread, Event
 from pyvirtualcam import Camera as virtualCamera
 from pyvirtualcam.camera import PixelFormat
 from numpy import frombuffer, uint8
 
 
-class vCamera(Thread):
-    def run(self):
+class vcamera(Thread):
+    def __init__(self, options):
+        Thread.__init__(self)
+        self.options = options
+        self._stop_event = Event()
+        self.format_dict = {"NV12": PixelFormat.NV12}
 
+    def run(self):
+        print("vcam starting")
         # Start video capturing loop
-        self.capture_ctrl = VideoCapture("INFRARED", "VIDEO_RECORD")
-        with self.capture_ctrl as self.capture_loop:
-            self.task = self.capture_loop.create_task(self.capture_ctrl.start())
-            self.capture_loop.run_forever()
-            # Start virtual camera loop
-            format_dict = {"NV12": PixelFormat.NV12}
-            with virtualCamera(
-                width=self.capture_ctrl.current_format["width"],
-                height=self.capture_ctrl.current_format["height"],
-                fps=30,
-                fmt=format_dict[self.capture_ctrl.current_format["type"]],
-                backend="unitycapture",
-                print_fps=True,
-            ) as vcam:
-                for frame in self.capture_ctrl.frames():
-                    vcam.send(frombuffer(bytes(frame), uint8))
-                    vcam.sleep_until_next_frame()
+        self.capture_ctrl = VideoCapture(self.options)
+        # Start virtual camera loop
+        with virtualCamera(
+            width=self.capture_ctrl.current_format["width"] if self.options['option_vcam_width_auto'] else self.options['option_vcam_width'],
+            height=self.capture_ctrl.current_format["height"] if self.options['option_vcam_height_auto'] else self.options['option_vcam_height'],
+            fps=self.options['option_vcam_fps'],
+            fmt=self.format_dict[self.capture_ctrl.current_format["type"] if self.options['option_vcam_pixel_format'].value == 'auto' else self.options['option_vcam_pixel_format']['value']],
+            backend="unitycapture",
+            print_fps=True,
+        ) as vcam:
+            print("vcam started")
+            self.capture_ctrl.start()
+            for frame in self.capture_ctrl.get_frame():
+                if self._stop_event.is_set():
+                    self.capture_ctrl.stop()
+                    break
+                print("update frame")
+                vcam.send(frombuffer(bytes(frame), uint8))
+            print("vcam stopped")
 
     def stop(self):
-        self.task.cancel()
-
-    @staticmethod
-    def show_stats(stop_event, counters, format):
-        from time import sleep, perf_counter
-        from copy import deepcopy
-
-        prev_counters = {"frame": 0, "black": 0, "skipped": 0}
-        while not stop_event.is_set():
-            time_keeper = perf_counter()
-            current_counters = deepcopy(counters)
-            captured_frames = current_counters["frame"] - prev_counters["frame"]
-            black_frames = current_counters["black"] - prev_counters["black"]
-            skipped_frames = current_counters["skipped"] - prev_counters["skipped"]
-            normal_frames = captured_frames - black_frames - skipped_frames
-            prev_counters = current_counters
-            print(f"captured frames: {captured_frames}/{format['fps']}")
-            print(f"normal frames: {normal_frames}/{captured_frames}")
-            print(f"black frames: {black_frames}/{captured_frames}")
-            print(f"skipped frames: {skipped_frames}/{captured_frames}\n")
-            sleep(1 + time_keeper - perf_counter())
-
-
-if __name__ == "__main__":
-    from time import sleep
-
-    test = vCamera()
-    print("Test start")
-    test.start()
-    sleep(3)
-    print("Test stop")
-    test.stop()
+        print("vcam stoping")
+        self._stop_event.set()
